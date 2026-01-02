@@ -2,8 +2,8 @@
 
 **Purpose**: Instructions for Claude Code to set up a complete wireless ESP32 development environment. After initial USB flash, all development happens over WiFi - no more cables needed.
 
-**Version**: 1.0.0
-**Last Updated**: 2024-12-30
+**Version**: 1.1.0
+**Last Updated**: 2026-01-02
 
 ---
 
@@ -152,7 +152,7 @@ board_build.partitions = min_spiffs.csv
 
 build_flags =
     -DPROJECT_NAME=\"{PROJECT_NAME}\"
-    -DFIRMWARE_VERSION=\"1.0.0-dev\"
+    ; FIRMWARE_VERSION is defined in config.h (single source of truth)
     ; Stack size for SSL/network operations
     -DARDUINO_LOOP_STACK_SIZE=16384
 
@@ -220,9 +220,8 @@ build_flags =
 #define PROJECT_NAME      "{PROJECT_NAME}"
 #endif
 
-#ifndef FIRMWARE_VERSION
+// Single source of truth for version - update here, run deploy.sh
 #define FIRMWARE_VERSION  "1.0.0-dev"
-#endif
 
 // ============================================================================
 // NETWORK SETTINGS
@@ -259,7 +258,7 @@ build_flags =
 // NVS STORAGE
 // ============================================================================
 
-// Namespace - must be unique per project (max 15 chars)
+// Namespace - must be unique per project (max 13 chars to be safe)
 #define NVS_NAMESPACE         "{NVS_NAMESPACE}"
 
 // Keys
@@ -509,6 +508,7 @@ bool wifiHasCredentials();
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <esp_task_wdt.h>
 
 static WebServer server(80);
 static DNSServer dnsServer;
@@ -596,6 +596,7 @@ bool wifiConnect() {
     int attempts = 0;
 
     while (WiFi.status() != WL_CONNECTED && millis() - startTime < WIFI_TIMEOUT) {
+        esp_task_wdt_reset();  // Feed watchdog during connection attempt
         delay(500);
         DEBUG_PRINT(".");
         attempts++;
@@ -640,6 +641,7 @@ void wifiStartPortal() {
     bool ledState = false;
 
     while (portalRunning) {
+        esp_task_wdt_reset();  // Feed watchdog in portal loop
         dnsServer.processNextRequest();
         server.handleClient();
 
@@ -727,6 +729,8 @@ bool otaPerformUpdate();
 #include "../utils/debug_log.h"
 #include <HTTPClient.h>
 #include <Update.h>
+#include <NetworkClient.h>
+#include <esp_task_wdt.h>
 
 const char* otaGetVersion() {
     return FIRMWARE_VERSION;
@@ -808,9 +812,16 @@ bool otaPerformUpdate() {
         return false;
     }
 
-    WiFiClient* stream = http.getStreamPtr();
+    // Disable watchdog for long download (can take 30+ seconds)
+    esp_task_wdt_delete(NULL);
+    debugLog("[OTA] Watchdog disabled for download...");
+
+    NetworkClient* stream = http.getStreamPtr();
     size_t written = Update.writeStream(*stream);
     http.end();
+
+    // Re-enable watchdog after download
+    esp_task_wdt_add(NULL);
 
     if (written != size) {
         debugLogf("[OTA] Write error: %d/%d", written, size);
@@ -947,6 +958,7 @@ void nvsRemove(const char* key) {
 #include "network/ota_update.h"
 #include "storage/nvs_manager.h"
 #include <esp_task_wdt.h>
+#include <esp_ota_ops.h>
 
 // Double-reset detection for config mode
 #include <esp_system.h>
@@ -957,22 +969,30 @@ static unsigned long lastOtaCheck = 0;
 static bool configMode = false;
 
 // Check for double-reset (enter config mode)
+// Uses RTC memory to detect if reset happened within 3 seconds
 bool checkDoubleReset() {
+    // Feed watchdog during this check
+    esp_task_wdt_reset();
+
     unsigned long now = millis();
 
     // If reset happened within 3 seconds of last reset
-    if (resetCount > 0 && (now < 3000)) {
+    // Also validate resetCount is reasonable (not garbage from first boot)
+    if (resetCount > 0 && resetCount < 10 && (now < 3000)) {
         resetCount = 0;
         return true;
     }
 
-    // Increment reset count, will be cleared after 3 seconds
-    resetCount++;
+    // Set reset count to 1 (not increment - avoids garbage accumulation)
+    resetCount = 1;
 
-    // Clear reset count after 3 seconds
-    delay(3000);
+    // Wait 3 seconds, feeding watchdog periodically
+    for (int i = 0; i < 30; i++) {
+        esp_task_wdt_reset();
+        delay(100);
+    }
+
     resetCount = 0;
-
     return false;
 }
 
@@ -1001,8 +1021,7 @@ void setup() {
     // Initialize NVS
     nvsInit();
 
-    // Initialize watchdog (30 second timeout)
-    esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
+    // Add loopTask to watchdog (Arduino framework already initialized WDT)
     esp_task_wdt_add(NULL);
 
     // Check for double-reset (manual config mode entry)
@@ -1034,7 +1053,6 @@ void setup() {
 
         // Mark OTA partition as valid (for rollback protection)
         // Only after successful boot + WiFi connect
-        #include <esp_ota_ops.h>
         esp_ota_mark_app_valid_cancel_rollback();
 
     } else {
@@ -1252,42 +1270,52 @@ echo -e "${GREEN}Server reachable${NC}"
 echo ""
 echo -e "${YELLOW}Checking HTTP server...${NC}"
 
+# Create directory structure first (needed for directory check)
+ssh $SERVER_USER@$SERVER_HOST "mkdir -p $SERVER_DEPLOY_DIR $SERVER_LOG_DIR $SERVER_SCRIPT_DIR"
+
 # Get PID of any HTTP server on our port
-HTTP_PID=$(ssh $SERVER_USER@$SERVER_HOST "pgrep -f 'python.*http.server.*$SERVER_PORT'" 2>/dev/null || echo "")
+# NOTE: Use ps aux instead of pgrep - pgrep can return stale PIDs on some systems
+HTTP_PID=$(ssh $SERVER_USER@$SERVER_HOST "ps aux | grep 'python.*http.server.*$SERVER_PORT' | grep -v grep | awk '{print \$2}' | head -1" 2>/dev/null || echo "")
 
-if [ -n "$HTTP_PID" ]; then
+START_NEW_SERVER=false
+
+if [ -z "$HTTP_PID" ]; then
+    echo -e "${BLUE}No HTTP server running on port $SERVER_PORT${NC}"
+    START_NEW_SERVER=true
+else
     # Check what directory it's serving
-    CURRENT_DIR=$(ssh $SERVER_USER@$SERVER_HOST "readlink /proc/$HTTP_PID/cwd" 2>/dev/null || echo "")
+    echo -e "${BLUE}HTTP server found (PID: $HTTP_PID) - checking directory...${NC}"
+    SERVER_CWD=$(ssh $SERVER_USER@$SERVER_HOST "readlink -f /proc/$HTTP_PID/cwd 2>/dev/null" || echo "")
 
-    if [ "$CURRENT_DIR" != "$SERVER_DEPLOY_DIR" ]; then
+    if [ -z "$SERVER_CWD" ]; then
+        echo -e "${YELLOW}Could not determine server directory - restarting${NC}"
+        START_NEW_SERVER=true
+    elif [ "$SERVER_CWD" != "$SERVER_DEPLOY_DIR" ]; then
         echo -e "${YELLOW}HTTP server serving wrong directory - restarting...${NC}"
-        echo "  Current: $CURRENT_DIR"
+        echo "  Current: $SERVER_CWD"
         echo "  Expected: $SERVER_DEPLOY_DIR"
-        ssh $SERVER_USER@$SERVER_HOST "kill $HTTP_PID" 2>/dev/null || true
+        ssh $SERVER_USER@$SERVER_HOST "pkill -f 'python.*http.server.*$SERVER_PORT'" 2>/dev/null || true
         sleep 1
-        HTTP_PID=""
+        START_NEW_SERVER=true
+    else
+        echo -e "${GREEN}HTTP server running correctly from $SERVER_DEPLOY_DIR (PID: $HTTP_PID)${NC}"
     fi
 fi
 
-if [ -z "$HTTP_PID" ]; then
-    echo -e "${BLUE}Starting HTTP server...${NC}"
-
-    # Create directory structure
-    ssh $SERVER_USER@$SERVER_HOST "mkdir -p $SERVER_DEPLOY_DIR $SERVER_LOG_DIR $SERVER_SCRIPT_DIR"
+if [ "$START_NEW_SERVER" = true ]; then
+    echo -e "${BLUE}Starting HTTP server from $SERVER_DEPLOY_DIR...${NC}"
 
     # Start HTTP server
     ssh $SERVER_USER@$SERVER_HOST "cd $SERVER_DEPLOY_DIR && nohup python3 -m http.server $SERVER_PORT > $SERVER_LOG_DIR/http_server.log 2>&1 &"
     sleep 1
 
     # Verify
-    HTTP_PID=$(ssh $SERVER_USER@$SERVER_HOST "pgrep -f 'python.*http.server.*$SERVER_PORT'" 2>/dev/null || echo "")
+    HTTP_PID=$(ssh $SERVER_USER@$SERVER_HOST "ps aux | grep 'python.*http.server.*$SERVER_PORT' | grep -v grep | awk '{print \$2}' | head -1" 2>/dev/null || echo "")
     if [ -z "$HTTP_PID" ]; then
         echo -e "${RED}ERROR: Failed to start HTTP server${NC}"
         exit 1
     fi
     echo -e "${GREEN}HTTP server started (PID: $HTTP_PID)${NC}"
-else
-    echo -e "${GREEN}HTTP server already running (PID: $HTTP_PID)${NC}"
 fi
 
 # ============================================================================
@@ -1333,80 +1361,117 @@ else
 fi
 
 # ============================================================================
-# Ensure syslog listener is running
+# Ensure SHARED syslog listener is running (handles all projects)
 # ============================================================================
 
 echo ""
-echo -e "${YELLOW}Checking syslog listener...${NC}"
+echo -e "${YELLOW}Checking syslog infrastructure...${NC}"
 
-SYSLOG_RUNNING=$(ssh $SERVER_USER@$SERVER_HOST "ss -uln | grep ':$SYSLOG_PORT '" 2>/dev/null || echo "")
+# Base directory for all projects
+SERVER_PROJECTS_DIR="/home/$SERVER_USER/projects"
+SHARED_SYSLOG_SCRIPT="$SERVER_PROJECTS_DIR/shared_syslog_listener.py"
 
-if [ -z "$SYSLOG_RUNNING" ]; then
-    echo -e "${BLUE}Starting syslog listener...${NC}"
+# Step 1: Kill any OLD per-project syslog listeners (they break multi-project setup)
+echo -e "${BLUE}Cleaning up old per-project listeners...${NC}"
+OLD_LISTENERS=$(ssh $SERVER_USER@$SERVER_HOST "ps aux | grep 'projects/.*/scripts/syslog_listener' | grep -v grep | awk '{print \$2}'" 2>/dev/null || echo "")
+if [ -n "$OLD_LISTENERS" ]; then
+    echo -e "${YELLOW}Killing old per-project syslog listeners...${NC}"
+    ssh $SERVER_USER@$SERVER_HOST "sudo pkill -f 'projects/.*/scripts/syslog_listener'" 2>/dev/null || true
+    sleep 1
+fi
 
-    # Create self-rotating Python syslog listener
-    ssh $SERVER_USER@$SERVER_HOST "cat > $SERVER_SCRIPT_DIR/syslog_listener.py << 'EOFPY'
+# Step 2: Check if SHARED syslog listener is running
+SHARED_RUNNING=$(ssh $SERVER_USER@$SERVER_HOST "ps aux | grep 'shared_syslog_listener' | grep -v grep" 2>/dev/null || echo "")
+
+if [ -z "$SHARED_RUNNING" ]; then
+    echo -e "${BLUE}Starting shared syslog listener...${NC}"
+
+    # Create shared multi-project syslog listener
+    ssh $SERVER_USER@$SERVER_HOST "cat > $SHARED_SYSLOG_SCRIPT << 'EOFPY'
 #!/usr/bin/env python3
-\"\"\"Self-rotating syslog listener for ESP32 debug logs.\"\"\"
+\"\"\"Shared multi-project syslog listener. Routes logs by project name.\"\"\"
 import socket
 import os
+import re
 from datetime import datetime
 
-LOG_DIR = \"$SERVER_LOG_DIR\"
-LOG_FILE = os.path.join(LOG_DIR, \"esp32.log\")
+BASE_DIR = \"/home/$SERVER_USER/projects\"
+PROJECT_PATTERN = re.compile(r\"<\\d+>([^:]+):\\s*(.*)\")
 MAX_SIZE_MB = 5
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 
-def rotate_if_needed():
-    if not os.path.exists(LOG_FILE):
+def rotate_if_needed(log_file):
+    if not os.path.exists(log_file):
         return
-    if os.path.getsize(LOG_FILE) < MAX_SIZE_BYTES:
+    if os.path.getsize(log_file) < MAX_SIZE_BYTES:
         return
-    if os.path.exists(LOG_FILE + \".2\"):
-        os.remove(LOG_FILE + \".2\")
-    if os.path.exists(LOG_FILE + \".1\"):
-        os.rename(LOG_FILE + \".1\", LOG_FILE + \".2\")
-    os.rename(LOG_FILE, LOG_FILE + \".1\")
-    print(f\"[ROTATE] Log rotated at {datetime.now()}\", flush=True)
+    for i in range(2, 0, -1):
+        if os.path.exists(f\"{log_file}.{i}\"):
+            if i == 2:
+                os.remove(f\"{log_file}.{i}\")
+            else:
+                os.rename(f\"{log_file}.{i}\", f\"{log_file}.{i+1}\")
+    os.rename(log_file, f\"{log_file}.1\")
+    print(f\"[ROTATE] {log_file} rotated at {datetime.now()}\", flush=True)
 
 def main():
-    os.makedirs(LOG_DIR, exist_ok=True)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((\"0.0.0.0\", 514))
-    print(f\"Listening for syslog on UDP port 514...\", flush=True)
+    print(\"Shared syslog listener running on UDP port 514...\", flush=True)
+    print(f\"Routing logs to: {BASE_DIR}/{{project-name}}/logs/esp32.log\", flush=True)
 
-    with open(LOG_FILE, \"a\") as f:
-        line_count = 0
-        while True:
-            data, addr = sock.recvfrom(1024)
-            msg = data.decode(\"utf-8\", errors=\"ignore\").strip()
-            timestamp = datetime.now().strftime(\"%Y-%m-%d %H:%M:%S\")
-            line = f\"[{timestamp}] [{addr[0]}] {msg}\"
-            print(line, flush=True)
+    line_counts = {}
+
+    while True:
+        data, addr = sock.recvfrom(1024)
+        msg = data.decode(\"utf-8\", errors=\"ignore\").strip()
+
+        # Parse project name from syslog message: <priority>project-name: message
+        match = PROJECT_PATTERN.match(msg)
+        if match:
+            project_name = match.group(1)
+            message = match.group(2)
+        else:
+            project_name = \"unknown\"
+            message = msg
+
+        # Route to project-specific log directory
+        log_dir = os.path.join(BASE_DIR, project_name, \"logs\")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, \"esp32.log\")
+
+        timestamp = datetime.now().strftime(\"%Y-%m-%d %H:%M:%S\")
+        line = f\"[{timestamp}] [{addr[0]}] {message}\"
+
+        print(f\"[{project_name}] {line}\", flush=True)
+
+        with open(log_file, \"a\") as f:
             f.write(line + \"\\n\")
-            f.flush()
-            line_count += 1
-            if line_count >= 100:
-                line_count = 0
-                rotate_if_needed()
+
+        # Rotate check every 100 lines per project
+        line_counts[project_name] = line_counts.get(project_name, 0) + 1
+        if line_counts[project_name] >= 100:
+            line_counts[project_name] = 0
+            rotate_if_needed(log_file)
 
 if __name__ == \"__main__\":
     main()
 EOFPY"
 
-    # Start listener (requires sudo for port 514)
-    ssh $SERVER_USER@$SERVER_HOST "nohup sudo python3 $SERVER_SCRIPT_DIR/syslog_listener.py > $SERVER_LOG_DIR/syslog_listener.out 2>&1 &"
+    # Start shared listener (requires sudo for port 514)
+    ssh $SERVER_USER@$SERVER_HOST "nohup sudo python3 $SHARED_SYSLOG_SCRIPT > $SERVER_PROJECTS_DIR/shared_syslog.log 2>&1 &"
     sleep 1
 
-    SYSLOG_RUNNING=$(ssh $SERVER_USER@$SERVER_HOST "ss -uln | grep ':$SYSLOG_PORT '" 2>/dev/null || echo "")
-    if [ -n "$SYSLOG_RUNNING" ]; then
-        echo -e "${GREEN}Syslog listener started${NC}"
+    # Verify it started
+    SHARED_RUNNING=$(ssh $SERVER_USER@$SERVER_HOST "ps aux | grep 'shared_syslog_listener' | grep -v grep" 2>/dev/null || echo "")
+    if [ -n "$SHARED_RUNNING" ]; then
+        echo -e "${GREEN}Shared syslog listener started${NC}"
     else
-        echo -e "${YELLOW}WARNING: Could not start syslog listener (may need sudo password)${NC}"
-        echo "  Manual start: ssh $SERVER_USER@$SERVER_HOST 'sudo python3 $SERVER_SCRIPT_DIR/syslog_listener.py'"
+        echo -e "${YELLOW}WARNING: Could not start shared syslog listener (may need sudo password)${NC}"
+        echo "  Manual start: ssh $SERVER_USER@$SERVER_HOST 'sudo python3 $SHARED_SYSLOG_SCRIPT'"
     fi
 else
-    echo -e "${GREEN}Syslog listener already running${NC}"
+    echo -e "${GREEN}Shared syslog listener already running${NC}"
 fi
 
 # ============================================================================
@@ -1449,11 +1514,87 @@ ESP32 wireless development project with OTA updates and remote logging.
 
 **The code on disk is NOT the code running on the ESP32!**
 
-1. Editing files only changes source code on your computer
-2. Only `./deploy.sh --usb` or `./deploy.sh` (OTA) updates the MCU
-3. Check logs to verify MCU version: look for `[BOOT] {PROJECT_NAME} vX.X.X`
+### Rules for Claude
+1. **Code in git ≠ Code on MCU** - Just because code exists locally doesn't mean it's running on the device
+2. **Only USB flash or OTA updates change MCU firmware** - Editing files does nothing until deployed
+3. **Check logs to verify MCU version** - Look for `[BOOT] {PROJECT_NAME} vX.X.X` in logs
+4. **Never assume** - If unsure what version is on MCU, check logs or ask user
+5. **Track deploy events** - Remember when USB upload or OTA deploy was performed in the session
 
-### Build Commands
+### Common Mistakes to Avoid
+- ❌ "The device is running the new code now" (without having deployed it)
+- ❌ "The fix should work now" (for code not yet on MCU)
+- ❌ Assuming edited code is active without a deploy step
+- ✅ "I've edited the code locally. To get it on the MCU, run `./deploy.sh`"
+
+---
+
+## Version Increment Rules
+
+**Version format**: `MAJOR.MINOR.PATCH-suffix` (e.g., `1.0.1-dev`)
+
+### When to Increment Version
+
+**Increment BEFORE deploying to MCU** (USB upload or OTA deploy):
+- About to test a code change on hardware
+- Running `./deploy.sh` or `./deploy.sh --usb`
+
+### When NOT to Increment
+
+**Do NOT increment for**:
+- Build-only (`./deploy.sh --build-only`)
+- Code edits that haven't been deployed yet
+- Multiple iterations of the same fix before testing
+- Documentation or comment-only changes
+
+### The Rule
+
+**One increment per deploy event, not per edit.**
+
+If making 5 edits, deploying, making 3 more edits, then deploying again:
+- First deploy: increment to X.X.2
+- Second deploy: increment to X.X.3
+- NOT: X.X.8 (one per edit)
+
+### Why This Matters
+
+- Version in logs identifies which code is running
+- Allows correlating log output with specific code changes
+- Without incrementing, can't tell if new code is running vs old
+
+---
+
+## Build & Deploy Commands
+
+### Primary Command: deploy.sh
+
+**ALWAYS use `./deploy.sh` for building and deploying.** It handles everything automatically.
+
+```bash
+# First time (USB flash + server setup)
+./deploy.sh --usb
+
+# Normal development (OTA - wireless)
+./deploy.sh
+
+# Other options
+./deploy.sh --build-only   # Just build, don't deploy
+./deploy.sh --skip-build   # Redeploy existing binary
+./deploy.sh --help         # Show help
+```
+
+### What deploy.sh Does Automatically
+
+1. Builds firmware using PlatformIO
+2. Reads version from `src/config.h`
+3. Creates project directory structure on server
+4. Copies firmware.bin to server
+5. Creates version.txt with format `{PROJECT_NAME}:version`
+6. Starts/restarts HTTP server for OTA
+7. Starts shared syslog listener if not running
+8. Kills any old per-project syslog listeners
+
+### Manual Build (if needed)
 
 **IMPORTANT**: Always use full path to PlatformIO:
 
@@ -1465,21 +1606,6 @@ ESP32 wireless development project with OTA updates and remote logging.
 pio run -e {BUILD_ENV}
 ```
 
-### Deploy Commands
-
-```bash
-# First time (USB flash + server setup)
-./deploy.sh --usb
-
-# After that (OTA - wireless)
-./deploy.sh
-
-# Other options
-./deploy.sh --build-only   # Just build
-./deploy.sh --skip-build   # Redeploy existing binary
-./deploy.sh --help         # Show help
-```
-
 ---
 
 ## Development Infrastructure
@@ -1489,16 +1615,18 @@ pio run -e {BUILD_ENV}
 ### Directory Structure on Server
 
 ```
-/home/{SERVER_USER}/projects/{PROJECT_NAME}/
-├── logs/
-│   ├── esp32.log              # ESP32 debug logs (self-rotating at 5MB)
-│   ├── esp32.log.1            # Previous log
-│   └── esp32.log.2            # Older log
-├── firmware/
-│   ├── firmware.bin           # Current firmware for OTA
-│   └── version.txt            # {PROJECT_NAME}:X.X.X-dev
-└── scripts/
-    └── syslog_listener.py     # Log receiver
+/home/{SERVER_USER}/projects/
+├── shared_syslog_listener.py  # SHARED log receiver (routes by project name)
+├── syslog_listener.log        # Syslog listener output
+└── {PROJECT_NAME}/
+    ├── logs/
+    │   ├── esp32.log          # ESP32 debug logs (self-rotating at 5MB)
+    │   ├── esp32.log.1        # Previous log
+    │   └── esp32.log.2        # Older log
+    ├── firmware/
+    │   ├── firmware.bin       # Current firmware for OTA
+    │   └── version.txt        # {PROJECT_NAME}:X.X.X-dev
+    └── scripts/               # (empty - syslog is shared)
 ```
 
 ### Commands You'll Use
@@ -1514,8 +1642,8 @@ ssh {SERVER_USER}@{SERVER_HOST} 'tail -100 /home/{SERVER_USER}/projects/{PROJECT
 curl http://{SERVER_HOST}:8080/version.txt
 
 # Check if services are running
-ssh {SERVER_USER}@{SERVER_HOST} 'pgrep -a python.*http.server'
-ssh {SERVER_USER}@{SERVER_HOST} 'ss -uln | grep :514'
+ssh {SERVER_USER}@{SERVER_HOST} 'ps aux | grep python.*http.server | grep -v grep'
+ssh {SERVER_USER}@{SERVER_HOST} 'ps aux | grep shared_syslog_listener | grep -v grep'
 ```
 
 ---
@@ -1537,12 +1665,50 @@ Each project uses its own:
 If ESP32 downloads wrong firmware:
 ```bash
 # Check what HTTP servers are running
-ssh {SERVER_USER}@{SERVER_HOST} 'pgrep -a python.*http.server'
+ssh {SERVER_USER}@{SERVER_HOST} 'ps aux | grep python.*http.server | grep -v grep'
 
 # Kill all and restart correct one
 ssh {SERVER_USER}@{SERVER_HOST} 'pkill -f "python.*http.server"'
 ./deploy.sh --skip-build  # Restarts correct server
 ```
+
+### Syslog Infrastructure - IMPORTANT
+
+The server uses a **SHARED** syslog listener at `/home/{SERVER_USER}/projects/shared_syslog_listener.py`.
+
+This listener:
+1. Binds to UDP port 514 (requires sudo)
+2. Parses project name from syslog: `<priority>project-name: message`
+3. Routes logs to: `/home/{SERVER_USER}/projects/{project-name}/logs/esp32.log`
+
+**NEVER run old per-project syslog listeners:**
+```bash
+# WRONG - breaks multi-project logging!
+ssh {SERVER_USER}@{SERVER_HOST} 'python3 /home/{SERVER_USER}/projects/*/scripts/syslog_listener.py'
+```
+
+**ALWAYS use deploy.sh to manage syslog:**
+```bash
+# CORRECT - deploy.sh handles everything
+./deploy.sh --skip-build
+```
+
+**Check syslog status:**
+```bash
+# Should show shared_syslog_listener.py ONLY
+ssh {SERVER_USER}@{SERVER_HOST} 'ps aux | grep syslog | grep -v grep'
+
+# Good: python3 shared_syslog_listener.py
+# Bad: python3 /home/.../projects/other-project/scripts/syslog_listener.py
+```
+
+**If logs go to wrong place:**
+```bash
+# Fix: deploy.sh kills wrong listeners, starts shared one
+./deploy.sh --skip-build
+```
+
+**Note:** After server reboot, no syslog listener runs until deploy.sh is executed. This is intentional - keeps the server "clean" with no permanent services.
 
 ### Enter config mode (reconfigure WiFi)
 
@@ -1596,13 +1762,19 @@ void loop() {
 
 ## Version Bumping
 
-Before deploying changes, bump the version in `src/config.h`:
+**Location**: `src/config.h` (single source of truth)
 
 ```cpp
 #define FIRMWARE_VERSION  "1.0.1-dev"  // Was 1.0.0-dev
 ```
 
-Then run `./deploy.sh`. ESP32 will auto-update within 60 seconds.
+**Workflow**:
+1. Edit `FIRMWARE_VERSION` in `src/config.h`
+2. Run `./deploy.sh`
+3. ESP32 auto-updates within 60 seconds
+4. Verify in logs: `[BOOT] {PROJECT_NAME} v1.0.1-dev`
+
+See "Version Increment Rules" section above for when to bump.
 
 ---
 {XIAO_C6_SSL_NOTE}
@@ -1740,7 +1912,7 @@ When creating files, replace these placeholders:
 | `{SERVER_HOST}` | User input (IP address) |
 | `{SERVER_USER}` | User input (username) |
 | `{BUILD_ENV}` | Based on board selection |
-| `{NVS_NAMESPACE}` | First 15 chars of PROJECT_NAME |
+| `{NVS_NAMESPACE}` | First 13 chars of PROJECT_NAME (max 13 for safety) |
 | `{XIAO_C6_SSL_NOTE}` | SSL notes if XIAO C6, empty otherwise |
 
 ---
